@@ -128,9 +128,10 @@ jobs:
           find . -name "BUILD.bazel" -exec sed -i 's/check_defconfig = "minimized"/check_defconfig = "disabled"/g' {} + || true
           find . -name "BUILD.bazel" -exec sed -i 's/check_defconfig = "true"/check_defconfig = "disabled"/g' {} + || true
 
-          # Force full source compilation of GKI boot.img + vendor modules (disable prebuilt GKI download)
+          # Force full source compilation of GKI boot.img + vendor modules (disable prebuilt GKI download without deleting flag_alias in common.bazelrc)
           find . -name "*.bazelrc" -exec sed -i 's/13202960/14691759/g' {} + || true
-          find . -name "*.bazelrc" -exec sed -i '/use_prebuilt_gki/d' {} + || true
+          find . -name "device.bazelrc" -exec sed -i 's/--use_prebuilt_gki$/--use_prebuilt_gki=false/g' {} + || true
+          find . -name "device.bazelrc" -exec sed -i 's/--use_prebuilt_gki=true/--use_prebuilt_gki=false/g' {} + || true
           find . -name "*.bazelrc" -exec sed -i 's/build --use_signed_prebuilts=true/build --use_signed_prebuilts=false/g' {} + || true
           find . -name "*.bazelrc" -exec sed -i 's/build --download_prebuilt_gki_fips140=true/build --download_prebuilt_gki_fips140=false/g' {} + || true
 
@@ -154,7 +155,10 @@ jobs:
 
           echo "=== Verifying built Kernel Image and Config ==="
           ls -lh out/dist/
-          strings out/dist/Image | grep -E "Linux version [0-9]" | head -2 || true
+          if [ -f "bazel-bin/private/devices/google/pantah/kernel/Image.lz4" ]; then
+            echo "Using source-compiled Image.lz4 from bazel-bin/private/devices/google/pantah/kernel/Image.lz4"
+            cp -f bazel-bin/private/devices/google/pantah/kernel/Image.lz4 out/dist/Image.lz4
+          fi
 
           # Pack boot_b.img directly from our freshly compiled out/dist/Image.lz4 (Boot Header v4)
           python3 -c '
@@ -172,7 +176,7 @@ jobs:
               out.write(b"\x00" * pad)
           print("Built boot_halium_b.img from compiled Image.lz4:", len(hdr) + len(kdata) + pad)
           '
-          cp out/dist/boot_halium_b.img out/dist/boot.img
+          cp -f out/dist/boot_halium_b.img out/dist/boot.img
 
       - name: Build Slot-B Safe Initramfs (init_boot_b.img)
         run: |
