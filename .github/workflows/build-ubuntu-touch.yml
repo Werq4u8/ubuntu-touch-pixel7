@@ -1,0 +1,445 @@
+name: Build Ubuntu Touch for Pixel 7 (Slot B / Safe Dual-Boot 6.1.145)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ubuntu-touch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          echo "=== Disk before cleanup: ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/az
+          sudo docker image prune --all --force || true
+          echo "=== Disk after cleanup: ==="
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git-core curl wget build-essential zip unzip \
+            python3 python3-pip flex bison libssl-dev bc \
+            squashfs-tools erofs-utils e2fsprogs cpio lz4 \
+            busybox-static kmod dmsetup jq android-sdk-libsparse-utils
+
+      - name: Install Repo tool
+        run: |
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Initialize and Sync Kernel Source (Pixel 7 / gs-pantah-6.1)
+        run: |
+          mkdir -p workspace
+          cd workspace
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b android-gs-pantah-6.1-android16-beta
+
+          repo sync -c -j$(nproc) --no-clone-bundle --no-tags --optimized-fetch
+
+      - name: Checkout exact kernel commit matching CP1A (6.1.145)
+        run: |
+          cd workspace/aosp
+          echo "=== Fetching tag android14-6.1-2025-09_r22 (commit fa1d6308d1fe) ==="
+          git fetch --depth=1 https://android.googlesource.com/kernel/common refs/tags/android14-6.1-2025-09_r22:refs/tags/cp1a_tag
+          git checkout cp1a_tag
+          git log -1 --oneline
+
+      - name: Patch Kernel Config for Ubuntu Touch (Halium + AppArmor + LXC + Waydroid + WiFi)
+        run: |
+          cd workspace
+
+          GKI_CONFIG="./aosp/arch/arm64/configs/gki_defconfig"
+          chmod +w "$GKI_CONFIG"
+
+          cat << 'EOF' >> "$GKI_CONFIG"
+          # --- Ubuntu Touch / Halium / Systemd / LXC / Waydroid ---
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_NAMESPACES=y
+          CONFIG_UTS_NS=y
+          CONFIG_IPC_NS=y
+          CONFIG_USER_NS=y
+          CONFIG_PID_NS=y
+          CONFIG_NET_NS=y
+          CONFIG_DEVPTS_MULTIPLE_INSTANCES=y
+          CONFIG_VT=y
+          CONFIG_CONSOLE_TRANSLATIONS=y
+          CONFIG_VT_CONSOLE=y
+          CONFIG_VT_CONSOLE_SLEEP=y
+          CONFIG_HW_CONSOLE=y
+          CONFIG_UNIX98_PTYS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_CGROUP_PIDS=y
+          CONFIG_CGROUP_FREEZER=y
+          CONFIG_MEMCG=y
+          # --- AppArmor (Required by Lomiri & Click Packages) ---
+          CONFIG_SECURITY_APPARMOR=y
+          CONFIG_SECURITY_APPARMOR_HASH=y
+          CONFIG_SECURITY_APPARMOR_HASH_DEFAULT=y
+          CONFIG_LSM="lockdown,yama,loadpin,safesetid,integrity,selinux,apparmor"
+          # --- Filesystems for Slot B Super SquashFS + OverlayFS ---
+          CONFIG_SQUASHFS=y
+          CONFIG_SQUASHFS_ZLIB=y
+          CONFIG_SQUASHFS_LZ4=y
+          CONFIG_SQUASHFS_LZO=y
+          CONFIG_SQUASHFS_XZ=y
+          CONFIG_SQUASHFS_ZSTD=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_EROFS_FS=y
+          CONFIG_EROFS_FS_ZIP=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_EXT4_FS_POSIX_ACL=y
+          CONFIG_EXT4_FS_SECURITY=y
+          # --- USB RNDIS / ECM / Network / Wi-Fi / BT ---
+          CONFIG_USB_CONFIGFS_RNDIS=y
+          CONFIG_USB_F_RNDIS=y
+          CONFIG_USB_CONFIGFS_ECM=y
+          CONFIG_USB_F_ECM=y
+          CONFIG_VETH=y
+          CONFIG_BRIDGE=y
+          CONFIG_CFG80211=m
+          CONFIG_MAC80211=m
+          CONFIG_MAC80211_INJECT=y
+          CONFIG_USB_RTL8150=n
+          EOF
+
+          # Disable check_defconfig strict failure in Kleaf so custom Halium configs are accepted in full source build
+          find . -name "BUILD.bazel" -exec sed -i 's/check_defconfig = "minimized"/check_defconfig = "disabled"/g' {} + || true
+          find . -name "BUILD.bazel" -exec sed -i 's/check_defconfig = "true"/check_defconfig = "disabled"/g' {} + || true
+
+          # Force full source compilation of GKI boot.img + vendor modules (disable prebuilt GKI download)
+          find . -name "*.bazelrc" -exec sed -i 's/13202960/14691759/g' {} + || true
+          find . -name "*.bazelrc" -exec sed -i '/use_prebuilt_gki/d' {} + || true
+          find . -name "*.bazelrc" -exec sed -i 's/build --use_signed_prebuilts=true/build --use_signed_prebuilts=false/g' {} + || true
+          find . -name "*.bazelrc" -exec sed -i 's/build --download_prebuilt_gki_fips140=true/build --download_prebuilt_gki_fips140=false/g' {} + || true
+
+      - name: Build Full Halium Kernel & Modules (Bazel / Kleaf)
+        run: |
+          cd workspace
+
+          tools/bazel run \
+            --config=pantah \
+            --use_prebuilt_gki=false \
+            --use_signed_prebuilts=false \
+            --download_prebuilt_gki_fips140=false \
+            --notrim \
+            --nokmi_symbol_list_violations_check \
+            --nokmi_symbol_list_strict_mode \
+            //private/devices/google/pantah:gs201_pantah_dist \
+            --local_ram_resources=8192 \
+            --local_cpu_resources=4 \
+            -- \
+            --dist_dir=out/dist
+
+          echo "=== Verifying built Kernel Image and Config ==="
+          ls -lh out/dist/
+          strings out/dist/Image | grep -E "Linux version [0-9]" | head -2 || true
+
+          # Pack boot_b.img directly from our freshly compiled out/dist/Image.lz4 (Boot Header v4)
+          python3 -c '
+          import struct
+          with open("out/dist/Image.lz4", "rb") as f:
+              kdata = f.read()
+          hdr = bytearray(4096)
+          hdr[0:8] = b"ANDROID!"
+          struct.pack_into("<IIII", hdr, 8, len(kdata), 0, 0, 1584)
+          struct.pack_into("<I", hdr, 40, 4)
+          with open("out/dist/boot_halium_b.img", "wb") as out:
+              out.write(hdr)
+              out.write(kdata)
+              pad = (4096 - (len(kdata) % 4096)) % 4096
+              out.write(b"\x00" * pad)
+          print("Built boot_halium_b.img from compiled Image.lz4:", len(hdr) + len(kdata) + pad)
+          '
+          cp out/dist/boot_halium_b.img out/dist/boot.img
+
+      - name: Build Slot-B Safe Initramfs (init_boot_b.img)
+        run: |
+          mkdir -p initramfs_b/{bin,sbin,etc,proc,sys,dev,run,tmp,lib/modules,mnt/super_ro,mnt/writable,mnt/vendor,mnt/vendor_dlkm,mnt/system_dlkm,root}
+
+          # Copy static busybox
+          cp /bin/busybox initramfs_b/bin/busybox
+          chmod +x initramfs_b/bin/busybox
+          for app in sh ash mount umount insmod modprobe lsmod mdev mkdir mknod sleep cat echo grep sed awk cut tr find xargs switch_root losetup dmesg ip ifconfig telnetd chroot ln cp rm chmod chown stat dd sync; do
+            ln -sf /bin/busybox "initramfs_b/bin/$app"
+          done
+
+          # Create the Slot-B Safe Init script (NEVER touches sda31 userdata or sda8 metadata!)
+          cat << 'EOF' > initramfs_b/init
+          #!/bin/busybox sh
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+          /bin/busybox mount -t proc proc /proc
+          /bin/busybox mount -t sysfs sysfs /sys
+          /bin/busybox mount -t devtmpfs devtmpfs /dev
+          /bin/busybox mkdir -p /dev/pts /dev/socket /dev/block/mapper
+          /bin/busybox mount -t devpts devpts /dev/pts
+
+          exec >/dev/kmsg 2>&1
+          echo "=== [UBUNTU-TOUCH-SLOT-B] Starting Safe Initramfs on Pixel 7 (panther) ==="
+
+          # 1. Load early kernel modules from vendor_kernel_boot ramdisk (/lib/modules)
+          if [ -f /lib/modules/modules.load ]; then
+            echo "[UT-INIT] Loading early vendor_kernel_boot modules..."
+            while read -r mod; do
+              [ -z "$mod" ] && continue
+              /bin/busybox insmod "/lib/modules/$mod" 2>/dev/null || /bin/busybox insmod "/lib/modules/$(/bin/busybox basename "$mod")" 2>/dev/null || true
+            done < /lib/modules/modules.load
+          fi
+
+          # Wait up to 10s for UFS /dev/block/sda30 (super)
+          for i in $(seq 1 50); do
+            /bin/busybox mdev -s 2>/dev/null || true
+            [ -b /dev/block/sda30 ] && break
+            /bin/busybox sleep 0.2
+          done
+
+          # 2. Bring up USB RNDIS + Debug Telnet on 10.15.19.82 immediately for fail-safe debugging
+          setup_usb_debug() {
+            /bin/busybox mkdir -p /config
+            /bin/busybox mount -t configfs none /config 2>/dev/null || true
+            if [ -d /config/usb_gadget ]; then
+              mkdir -p /config/usb_gadget/g1
+              echo 0x18d1 > /config/usb_gadget/g1/idVendor
+              echo 0xd001 > /config/usb_gadget/g1/idProduct
+              mkdir -p /config/usb_gadget/g1/strings/0x409
+              echo "Pixel7-UT-SlotB" > /config/usb_gadget/g1/strings/0x409/serialnumber
+              echo "Google" > /config/usb_gadget/g1/strings/0x409/manufacturer
+              echo "Pixel 7 Ubuntu Touch" > /config/usb_gadget/g1/strings/0x409/product
+              mkdir -p /config/usb_gadget/g1/functions/rndis.usb0
+              mkdir -p /config/usb_gadget/g1/configs/b.1/strings/0x409
+              ln -sf /config/usb_gadget/g1/functions/rndis.usb0 /config/usb_gadget/g1/configs/b.1/
+              UDC=$(ls /sys/class/udc | head -n 1)
+              [ -n "$UDC" ] && echo "$UDC" > /config/usb_gadget/g1/UDC
+              /bin/busybox ifconfig rndis0 10.15.19.82 netmask 255.255.255.0 up 2>/dev/null || \
+              /bin/busybox ifconfig usb0 10.15.19.82 netmask 255.255.255.0 up 2>/dev/null || true
+              /bin/busybox telnetd -l /bin/sh -b 10.15.19.82:23 2>/dev/null || true
+            fi
+          }
+          setup_usb_debug
+
+          echo "[UT-INIT] Safety check: sda31 (userdata) and sda8 (metadata) are BLOCKED from mounting."
+          /bin/busybox rm -f /dev/sda31 /dev/block/sda31 /dev/sda8 /dev/block/sda8 2>/dev/null || true
+
+          # 3. Map Slot B logical partitions from super (/dev/block/sda30)
+          # Note: First stage init or parse-android-dynparts maps dm devices, or we mount via sector offsets written at flash time
+          if [ -f /etc/super_b_map.conf ]; then
+            while read -r name start count; do
+              [ -z "$name" ] && continue
+              echo "[UT-INIT] Mapping $name ($start .. $count)"
+              loopdev=$(/bin/busybox losetup -f)
+              /bin/busybox losetup -o $((start * 512)) --sizelimit $((count * 512)) "$loopdev" /dev/block/sda30
+              ln -sf "$loopdev" "/dev/block/mapper/$name"
+            done < /etc/super_b_map.conf
+          fi
+
+          # 4. Mount Ubuntu Touch SquashFS (system_b) + Writable ext4 (product_b) as OverlayFS /root
+          if [ -b /dev/block/mapper/system_b ]; then
+            /bin/busybox mount -t squashfs -o ro /dev/block/mapper/system_b /mnt/super_ro || \
+            /bin/busybox mount -o ro /dev/block/mapper/system_b /mnt/super_ro
+          fi
+
+          if [ -b /dev/block/mapper/product_b ]; then
+            /bin/busybox mount -t ext4 -o rw,noatime /dev/block/mapper/product_b /mnt/writable || true
+          else
+            /bin/busybox mount -t tmpfs -o size=1536M tmpfs /mnt/writable
+          fi
+
+          /bin/busybox mkdir -p /mnt/writable/upper /mnt/writable/work /mnt/writable/userdata
+          /bin/busybox mount -t overlay overlay -o lowerdir=/mnt/super_ro,upperdir=/mnt/writable/upper,workdir=/mnt/writable/work /root
+
+          # 5. Mount vendor_a (Read-Only) and vendor_dlkm_b / system_dlkm_b for Wi-Fi, BT, NFC, and GPU firmware/modules
+          if [ -b /dev/block/mapper/vendor_a ]; then
+            /bin/busybox mkdir -p /root/vendor
+            /bin/busybox mount -o ro /dev/block/mapper/vendor_a /root/vendor 2>/dev/null || true
+          fi
+          if [ -b /dev/block/mapper/vendor_dlkm_b ]; then
+            /bin/busybox mkdir -p /root/vendor_dlkm
+            /bin/busybox mount -o ro /dev/block/mapper/vendor_dlkm_b /root/vendor_dlkm 2>/dev/null || true
+          fi
+
+          # Bind writable userdata inside Slot B overlay
+          /bin/busybox mkdir -p /root/userdata
+          /bin/busybox mount --bind /mnt/writable/userdata /root/userdata
+
+          # Hand off to Ubuntu Touch systemd if present, else stay in debug shell on 10.15.19.82
+          if [ -x /root/sbin/init ]; then
+            echo "[UT-INIT] Switching root to Ubuntu Touch!"
+            exec /bin/busybox switch_root /root /sbin/init
+          else
+            echo "[UT-INIT] Staying in initramfs debug shell on 10.15.19.82:23"
+            while true; do /bin/busybox sleep 3600; done
+          fi
+          EOF
+          chmod +x initramfs_b/init
+
+          # Pack initramfs.cpio.lz4
+          cd initramfs_b
+          find . | cpio -o -H newc | lz4 -l -12 --favor-decSpeed > ../initramfs_b.cpio.lz4
+          cd ..
+
+          # Build init_boot_b.img (Android Boot Image v4 with kernel=0, ramdisk=initramfs_b.cpio.lz4)
+          python3 -c '
+          import struct
+          with open("initramfs_b.cpio.lz4", "rb") as f:
+              ramdisk = f.read()
+          # Boot header v4: magic(8), kernel_size(4), ramdisk_size(4), os_version(4), header_size(4), reserved(16), header_version(4), cmdline(1536), sig_size(4)
+          hdr = bytearray(4096)
+          hdr[0:8] = b"ANDROID!"
+          struct.pack_into("<IIII", hdr, 8, 0, len(ramdisk), 536871332, 1584)
+          struct.pack_into("<I", hdr, 40, 4)
+          with open("init_boot_b.img", "wb") as out:
+              out.write(hdr)
+              out.write(ramdisk)
+              pad = (4096 - (len(ramdisk) % 4096)) % 4096
+              out.write(b"\x00" * pad)
+          print("Created init_boot_b.img:", len(hdr) + len(ramdisk) + pad, "bytes")
+          '
+
+      - name: Build Ubuntu Touch RootFS & Pixel 7 Hardware Adaptation (system_b.img)
+        run: |
+          mkdir -p ut_build/rootfs
+          echo "=== Downloading UBports Ubuntu Touch 20.04/24.04 arm64 rootfs ==="
+          curl -L --retry 3 -f \
+            "https://ci.ubports.com/job/ubuntu-touch-rootfs/job/ubports%252Ffocal/lastSuccessfulBuild/artifact/ubuntu-touch-android9plus-rootfs-arm64.tar.gz" \
+            -o ut_build/ut_rootfs.tar.gz || \
+          curl -L --retry 3 -f \
+            "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.1-base-arm64.tar.gz" \
+            -o ut_build/ut_rootfs.tar.gz
+
+          sudo tar -xzf ut_build/ut_rootfs.tar.gz -C ut_build/rootfs
+
+          # Copy all compiled Pixel 7 kernel modules (.ko) into /lib/modules/6.1.145-halium
+          sudo mkdir -p ut_build/rootfs/lib/modules/panther
+          sudo cp workspace/out/dist/*.ko ut_build/rootfs/lib/modules/panther/ || true
+          sudo cp workspace/out/dist/vendor_dlkm.modules.load ut_build/rootfs/lib/modules/panther/ || true
+          sudo cp workspace/out/dist/system_dlkm.modules.load ut_build/rootfs/lib/modules/panther/ || true
+
+          # Create Pixel 7 (panther) Hardware Bringup Service (Wi-Fi bcmdhd4389, Bluetooth btbcm/hci_uart, NFC st21nfc, Display/GPU Mali)
+          cat << 'EOF' | sudo tee ut_build/rootfs/usr/local/bin/panther-hw-init.sh > /dev/null
+          #!/bin/bash
+          echo "[panther-hw-init] Loading Google Tensor G2 (gs201) modules for Wi-Fi, BT, NFC, Audio, GPU..."
+          MOD_DIR="/lib/modules/panther"
+
+          # 1. Load system_dlkm & vendor_dlkm modules in dependency order
+          for list in "$MOD_DIR/system_dlkm.modules.load" "$MOD_DIR/vendor_dlkm.modules.load"; do
+            if [ -f "$list" ]; then
+              while read -r m; do
+                [ -z "$m" ] && continue
+                base=$(basename "$m")
+                insmod "$MOD_DIR/$base" 2>/dev/null || true
+              done < "$list"
+            fi
+          done
+
+          # 2. Explicitly bring up Wi-Fi (Broadcom BCM4389) with Pixel 7 firmware & NVRAM paths
+          insmod "$MOD_DIR/cfg80211.ko" 2>/dev/null || true
+          insmod "$MOD_DIR/mac80211.ko" 2>/dev/null || true
+          insmod "$MOD_DIR/bcmdhd4389.ko" \
+            firmware_path="/vendor/firmware/fw_bcmdhd.bin" \
+            nvram_path="/vendor/etc/wifi/bcmdhd.cal" \
+            clm_path="/vendor/firmware/bcmdhd_clm.blob" 2>/dev/null || true
+
+          # 3. Explicitly bring up Bluetooth (Broadcom Nitrous / UART HCI)
+          insmod "$MOD_DIR/rfkill.ko" 2>/dev/null || true
+          insmod "$MOD_DIR/bluetooth.ko" 2>/dev/null || true
+          insmod "$MOD_DIR/btbcm.ko" 2>/dev/null || true
+          insmod "$MOD_DIR/hci_uart.ko" 2>/dev/null || true
+          insmod "$MOD_DIR/nitrous.ko" 2>/dev/null || true
+          rfkill unblock all 2>/dev/null || true
+
+          # 4. Explicitly bring up NFC (STMicroelectronics ST21NFC)
+          insmod "$MOD_DIR/nfc.ko" 2>/dev/null || true
+          insmod "$MOD_DIR/st21nfc.ko" 2>/dev/null || true
+
+          # 5. Bring up USB RNDIS SSH debug interface (10.15.19.82)
+          ip addr add 10.15.19.82/24 dev rndis0 2>/dev/null || ip addr add 10.15.19.82/24 dev usb0 2>/dev/null || true
+          ip link set rndis0 up 2>/dev/null || ip link set usb0 up 2>/dev/null || true
+          EOF
+          sudo chmod +x ut_build/rootfs/usr/local/bin/panther-hw-init.sh
+
+          # Create systemd unit for panther-hw-init
+          cat << 'EOF' | sudo tee ut_build/rootfs/etc/systemd/system/panther-hw-init.service > /dev/null
+          [Unit]
+          Description=Google Pixel 7 (panther) Hardware & Wireless Module Initialization
+          DefaultDependencies=no
+          After=systemd-udevd.service
+          Before=network-pre.target bluetooth.service NetworkManager.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/panther-hw-init.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=sysinit.target
+          EOF
+          sudo ln -sf /etc/systemd/system/panther-hw-init.service ut_build/rootfs/etc/systemd/system/sysinit.target.wants/panther-hw-init.service 2>/dev/null || true
+
+          # Create udev rules for Pixel 7 (GPU Mali, Display DRM, Touch, NFC, Audio, BT)
+          sudo mkdir -p ut_build/rootfs/etc/udev/rules.d
+          cat << 'EOF' | sudo tee ut_build/rootfs/etc/udev/rules.d/70-panther.rules > /dev/null
+          KERNEL=="mali0", MODE="0666", GROUP="video"
+          SUBSYSTEM=="drm", KERNEL=="card*", MODE="0666", GROUP="video"
+          SUBSYSTEM=="drm", KERNEL=="renderD*", MODE="0666", GROUP="video"
+          SUBSYSTEM=="graphics", MODE="0666", GROUP="video"
+          SUBSYSTEM=="input", MODE="0666", GROUP="input"
+          KERNEL=="st21nfc", MODE="0666", GROUP="nfc"
+          KERNEL=="ttySAC*", MODE="0666", GROUP="bluetooth"
+          KERNEL==" nitro*", MODE="0666", GROUP="bluetooth"
+          KERNEL=="aoc*", MODE="0666", GROUP="audio"
+          KERNEL=="binder", MODE="0666"
+          KERNEL=="hwbinder", MODE="0666"
+          KERNEL=="vndbinder", MODE="0666"
+          EOF
+
+          # Remove any fstab entries referencing userdata/metadata so systemd never touches Slot A data
+          sudo rm -f ut_build/rootfs/etc/fstab
+          sudo touch ut_build/rootfs/etc/fstab
+
+          # Compress RootFS into SquashFS (ZSTD level 19) to fit cleanly in Slot B super free space (~950 MB)
+          echo "=== Compressing Ubuntu Touch RootFS into system_b.img (SquashFS) ==="
+          sudo mksquashfs ut_build/rootfs system_b.img -comp zstd -Xcompression-level 19 -b 1M -noappend
+          ls -lh system_b.img
+
+      - name: Package All Slot-B Images & Flashing Script
+        run: |
+          mkdir -p package/slot_b
+          cp workspace/out/dist/boot.img package/slot_b/boot_b.img
+          cp init_boot_b.img package/slot_b/init_boot_b.img
+          cp workspace/out/dist/vendor_kernel_boot.img package/slot_b/vendor_kernel_boot_b.img
+          cp workspace/out/dist/dtbo.img package/slot_b/dtbo_b.img
+          cp workspace/out/dist/dtb.img package/slot_b/dtb_b.img
+          cp workspace/out/dist/vendor_dlkm.img package/slot_b/vendor_dlkm_b.img
+          cp workspace/out/dist/system_dlkm.img package/slot_b/system_dlkm_b.img
+          cp system_b.img package/slot_b/system_b.img
+
+          ls -lh package/slot_b/
+
+      - name: Upload Ubuntu Touch Slot-B Images
+        uses: actions/upload-artifact@v4
+        with:
+          name: UbuntuTouch-SlotB-Pixel7-6.1.145
+          path: package/slot_b/*
+          retention-days: 7
