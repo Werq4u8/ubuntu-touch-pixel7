@@ -1,0 +1,203 @@
+name: Build Safe Slot-B Initramfs (Fast 30s)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-initramfs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox-static gcc-aarch64-linux-gnu cpio lz4 python3
+
+      - name: Build static super partition scanner (find_super_parts) & init_boot_b.img
+        run: |
+          mkdir -p initramfs_b/{bin,sbin,etc,proc,sys,dev,run,tmp,lib/modules,mnt/super_ro,mnt/writable,mnt/vendor,mnt/vendor_dlkm,mnt/system_dlkm,root}
+
+          cp /bin/busybox initramfs_b/bin/busybox
+          chmod +x initramfs_b/bin/busybox
+          for app in sh ash mount umount insmod modprobe lsmod mdev mkdir mknod sleep cat echo grep sed awk cut tr find xargs switch_root losetup dmesg ip ifconfig telnetd chroot ln cp rm chmod chown stat dd sync basename dirname; do
+            ln -sf /bin/busybox "initramfs_b/bin/$app"
+          done
+
+          # Write fast static C scanner that finds exact byte offsets of system_b (SquashFS) and product_b (ext4 ut_writable) inside super (sda30)
+          cat << 'EOF' > find_super_parts.c
+          #define _GNU_SOURCE
+          #define _FILE_OFFSET_BITS 64
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+
+          int main(int argc, char **argv) {
+              const char *dev = (argc > 1) ? argv[1] : "/dev/block/sda30";
+              int fd = open(dev, O_RDONLY);
+              if (fd < 0) return 1;
+
+              // Slot A ends at sector 12618488 (byte 6460665856). Scan from sector 12600000 to end in 64KB steps (fastbootd aligns to 1MB = 2048 sectors)
+              uint64_t start_off = 12600000ULL * 512ULL;
+              uint64_t end_off   = 16662528ULL * 512ULL;
+              uint8_t buf[4096];
+              uint64_t found_squash = 0, found_ext4 = 0;
+
+              for (uint64_t off = start_off; off < end_off; off += 65536ULL) {
+                  if (pread(fd, buf, 4096, off) != 4096) break;
+                  // Check SquashFS magic 'hsqs' (0x73717368)
+                  if (!found_squash && memcmp(buf, "hsqs", 4) == 0) {
+                      found_squash = off;
+                      printf("system_b %llu 681574400\n", (unsigned long long)off);
+                  }
+                  // Check ext4 superblock at offset +1024: magic at +1024+56 (0xEF53) and volume name "ut_writable" at +1024+120
+                  uint16_t magic = *(uint16_t *)(buf + 1024 + 56);
+                  const char *label = (const char *)(buf + 1024 + 120);
+                  if (!found_ext4 && magic == 0xEF53 && strncmp(label, "ut_writable", 11) == 0) {
+                      found_ext4 = off;
+                      printf("product_b %llu 1310720000\n", (unsigned long long)off);
+                  }
+                  if (found_squash && found_ext4) break;
+              }
+              // Also output vendor_a (readonly at sector 10981376, size 1522024 sectors)
+              printf("vendor_a %llu %llu\n", 10981376ULL * 512ULL, 1522024ULL * 512ULL);
+              close(fd);
+              return 0;
+          }
+          EOF
+          aarch64-linux-gnu-gcc -O2 -static -o initramfs_b/bin/find_super_parts find_super_parts.c
+
+          cat << 'EOF' > initramfs_b/init
+          #!/bin/busybox sh
+          export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+          /bin/busybox mount -t proc proc /proc
+          /bin/busybox mount -t sysfs sysfs /sys
+          /bin/busybox mount -t devtmpfs devtmpfs /dev
+          /bin/busybox mkdir -p /dev/pts /dev/socket /dev/block/mapper
+          /bin/busybox mount -t devpts devpts /dev/pts
+
+          exec >/dev/kmsg 2>&1
+          echo "=== [UBUNTU-TOUCH-SLOT-B] Starting Safe Initramfs on Pixel 7 (panther) ==="
+
+          # 1. Load early kernel modules from vendor_kernel_boot ramdisk (/lib/modules)
+          MODLOAD=$(/bin/busybox find /lib/modules -name "modules.load" | /bin/busybox head -n 1)
+          if [ -n "$MODLOAD" ]; then
+            MODDIR=$(/bin/busybox dirname "$MODLOAD")
+            echo "[UT-INIT] Loading early modules from $MODLOAD..."
+            while read -r mod; do
+              [ -z "$mod" ] && continue
+              bname=$(/bin/busybox basename "$mod")
+              /bin/busybox insmod "$MODDIR/$mod" 2>/dev/null || /bin/busybox insmod "$MODDIR/$bname" 2>/dev/null || true
+            done < "$MODLOAD"
+          fi
+
+          # Wait up to 10s for UFS /dev/block/sda30 (super)
+          for i in $(/bin/busybox seq 1 50); do
+            /bin/busybox mdev -s 2>/dev/null || true
+            [ -b /dev/block/sda30 ] && break
+            [ -b /dev/sda30 ] && /bin/busybox ln -sf /dev/sda30 /dev/block/sda30 && break
+            /bin/busybox sleep 0.2
+          done
+
+          # Strictly block access to Slot A userdata (sda31) and metadata (sda8)
+          /bin/busybox rm -f /dev/sda31 /dev/block/sda31 /dev/sda8 /dev/block/sda8 2>/dev/null || true
+
+          # 2. Bring up USB RNDIS + Debug Telnet on 10.15.19.82
+          /bin/busybox mkdir -p /config
+          /bin/busybox mount -t configfs none /config 2>/dev/null || true
+          if [ -d /config/usb_gadget ]; then
+            /bin/busybox mkdir -p /config/usb_gadget/g1
+            echo 0x18d1 > /config/usb_gadget/g1/idVendor
+            echo 0xd001 > /config/usb_gadget/g1/idProduct
+            /bin/busybox mkdir -p /config/usb_gadget/g1/strings/0x409
+            echo "Pixel7-UT-SlotB" > /config/usb_gadget/g1/strings/0x409/serialnumber
+            echo "Google" > /config/usb_gadget/g1/strings/0x409/manufacturer
+            echo "Pixel 7 Ubuntu Touch" > /config/usb_gadget/g1/strings/0x409/product
+            /bin/busybox mkdir -p /config/usb_gadget/g1/functions/rndis.usb0
+            /bin/busybox mkdir -p /config/usb_gadget/g1/configs/b.1/strings/0x409
+            /bin/busybox ln -sf /config/usb_gadget/g1/functions/rndis.usb0 /config/usb_gadget/g1/configs/b.1/
+            UDC=$(/bin/busybox ls /sys/class/udc | /bin/busybox head -n 1)
+            [ -n "$UDC" ] && echo "$UDC" > /config/usb_gadget/g1/UDC
+            /bin/busybox ifconfig rndis0 10.15.19.82 netmask 255.255.255.0 up 2>/dev/null || \
+            /bin/busybox ifconfig usb0 10.15.19.82 netmask 255.255.255.0 up 2>/dev/null || true
+            /bin/busybox telnetd -l /bin/sh -b 10.15.19.82:23 2>/dev/null || true
+          fi
+
+          # 3. Automatically locate and map system_b (SquashFS), product_b (ext4 ut_writable), and vendor_a (RO) inside super (/dev/block/sda30)
+          /bin/find_super_parts /dev/block/sda30 > /tmp/super_parts.txt
+          while read -r name byte_off byte_len; do
+            [ -z "$name" ] && continue
+            echo "[UT-INIT] Found $name at offset=$byte_off size=$byte_len"
+            loopdev=$(/bin/busybox losetup -f)
+            if [ "$name" = "product_b" ]; then
+              /bin/busybox losetup -o "$byte_off" --sizelimit "$byte_len" "$loopdev" /dev/block/sda30
+            else
+              /bin/busybox losetup -r -o "$byte_off" --sizelimit "$byte_len" "$loopdev" /dev/block/sda30
+            fi
+            /bin/busybox ln -sf "$loopdev" "/dev/block/mapper/$name"
+          done < /tmp/super_parts.txt
+
+          # 4. Mount Ubuntu Touch SquashFS (system_b) + Writable ext4 (product_b) as OverlayFS /root
+          if [ -b /dev/block/mapper/system_b ]; then
+            /bin/busybox mount -t squashfs -o ro /dev/block/mapper/system_b /mnt/super_ro || \
+            /bin/busybox mount -o ro /dev/block/mapper/system_b /mnt/super_ro
+          fi
+
+          if [ -b /dev/block/mapper/product_b ]; then
+            /bin/busybox mount -t ext4 -o rw,noatime /dev/block/mapper/product_b /mnt/writable || \
+            /bin/busybox mount -t tmpfs -o size=1536M tmpfs /mnt/writable
+          else
+            /bin/busybox mount -t tmpfs -o size=1536M tmpfs /mnt/writable
+          fi
+
+          /bin/busybox mkdir -p /mnt/writable/upper /mnt/writable/work /mnt/writable/userdata
+          /bin/busybox mount -t overlay overlay -o lowerdir=/mnt/super_ro,upperdir=/mnt/writable/upper,workdir=/mnt/writable/work /root
+
+          # 5. Mount vendor_a Read-Only for Wi-Fi / BT / GPU firmware & HALs
+          if [ -b /dev/block/mapper/vendor_a ]; then
+            /bin/busybox mkdir -p /root/vendor
+            /bin/busybox mount -o ro /dev/block/mapper/vendor_a /root/vendor 2>/dev/null || true
+          fi
+
+          /bin/busybox mkdir -p /root/userdata
+          /bin/busybox mount --bind /mnt/writable/userdata /root/userdata
+
+          if [ -x /root/sbin/init ]; then
+            echo "[UT-INIT] Switching root to Ubuntu Touch /sbin/init!"
+            exec /bin/busybox switch_root /root /sbin/init
+          else
+            echo "[UT-INIT] Staying in debug shell on 10.15.19.82:23"
+            while true; do /bin/busybox sleep 3600; done
+          fi
+          EOF
+          chmod +x initramfs_b/init
+          ln -sf /init initramfs_b/system/bin/init 2>/dev/null || { mkdir -p initramfs_b/system/bin && ln -sf /init initramfs_b/system/bin/init; }
+
+          cd initramfs_b
+          find . | cpio -o -H newc | lz4 -l -12 --favor-decSpeed > ../initramfs_b.cpio.lz4
+          cd ..
+
+          python3 -c '
+          import struct
+          with open("initramfs_b.cpio.lz4", "rb") as f:
+              ramdisk = f.read()
+          hdr = bytearray(4096)
+          hdr[0:8] = b"ANDROID!"
+          struct.pack_into("<IIII", hdr, 8, 0, len(ramdisk), 536871332, 1584)
+          struct.pack_into("<I", hdr, 40, 4)
+          with open("init_boot_b.img", "wb") as out:
+              out.write(hdr)
+              out.write(ramdisk)
+              pad = (4096 - (len(ramdisk) % 4096)) % 4096
+              out.write(b"\x00" * pad)
+          print("Created init_boot_b.img:", len(hdr) + len(ramdisk) + pad, "bytes")
+          '
+
+      - name: Upload init_boot_b.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: init_boot_b
+          path: init_boot_b.img
+          retention-days: 7
