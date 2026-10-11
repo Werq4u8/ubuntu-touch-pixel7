@@ -135,44 +135,77 @@ jobs:
           sed -i '1i KBUILD_MODPOST_WARN := 1' ./aosp/scripts/Makefile.modpost || true
 
           # Disable check_defconfig and trim_nonlisted_kmi in Kleaf so custom Halium configs & symbols are accepted
-          find . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/check_defconfig = "minimized"/check_defconfig = "disabled"/g' {} + || true
-          find . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/check_defconfig = "true"/check_defconfig = "disabled"/g' {} + || true
-          find . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/trim_nonlisted_kmi = True/trim_nonlisted_kmi = False/g' {} + || true
+          find -L . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/check_defconfig = "minimized"/check_defconfig = "disabled"/g' {} + || true
+          find -L . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/check_defconfig = "true"/check_defconfig = "disabled"/g' {} + || true
+          find -L . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/trim_nonlisted_kmi = True/trim_nonlisted_kmi = False/g' {} + || true
 
-          # Replace kernel_aarch64_download_or_build with source-built kernel_aarch64 so vmlinux & modules share CONFIG_USER_NS
-          find private/ \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/kernel_aarch64_download_or_build/kernel_aarch64/g' {} + || true
+          # Replace all prebuilt/download_or_build targets with source-built //aosp:kernel_aarch64 across the workspace
+          find -L private/ build/ aosp/ \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i \
+            -e 's/kernel_aarch64_download_or_build/kernel_aarch64/g' \
+            -e 's/kernel_aarch64_downloaded/kernel_aarch64/g' \
+            -e 's/kernel_aarch64_gki_artifacts_download_or_build/kernel_aarch64_gki_artifacts/g' \
+            -e 's/kernel_aarch64_gki_artifacts_downloaded/kernel_aarch64_gki_artifacts/g' \
+            -e 's/kernel_aarch64_headers_download_or_build/kernel_aarch64_headers/g' \
+            -e 's/kernel_aarch64_headers_downloaded/kernel_aarch64_headers/g' {} + || true
 
-          # Force full source compilation of GKI boot.img + vendor modules (disable prebuilt GKI download without deleting flag_alias in common.bazelrc)
-          find . -name "*.bazelrc" -exec sed -i 's/13202960/14691759/g' {} + || true
-          find . -name "*.bazelrc" -exec sed -i 's/--use_prebuilt_gki$/--use_prebuilt_gki=false/g' {} + || true
-          find . -name "*.bazelrc" -exec sed -i 's/--use_prebuilt_gki=true/--use_prebuilt_gki=false/g' {} + || true
-          find . -name "*.bazelrc" -exec sed -i 's/build --use_signed_prebuilts=true/build --use_signed_prebuilts=false/g' {} + || true
-          find . -name "*.bazelrc" -exec sed -i 's/build --download_prebuilt_gki_fips140=true/build --download_prebuilt_gki_fips140=false/g' {} + || true
+          # Remove any 'build ... use_prebuilt_gki' lines in .bazelrc files while preserving 'common --flag_alias=use_prebuilt_gki=...'
+          find -L . -name "*.bazelrc" -exec sed -i '/^build.*use_prebuilt_gki/d' {} + || true
+          find -L . -name "*.bazelrc" -exec sed -i 's/build --use_signed_prebuilts=true/build --use_signed_prebuilts=false/g' {} + || true
+          find -L . -name "*.bazelrc" -exec sed -i 's/build --download_prebuilt_gki_fips140=true/build --download_prebuilt_gki_fips140=false/g' {} + || true
 
-      - name: Build Full Halium Kernel & Modules (Bazel / Kleaf)
+      - name: Build Full Halium Kernel & Modules from Source (Bazel / Kleaf)
         run: |
           cd workspace
 
+          # 1. Explicitly build //aosp:kernel_aarch64 from source first so Image.lz4 & vmlinux include Halium configs
+          tools/bazel build \
+            --config=pantah \
+            --use_prebuilt_gki=false \
+            --use_signed_prebuilts=false \
+            --download_prebuilt_gki_fips140=false \
+            --lto=none \
+            --notrim \
+            --nokmi_symbol_list_violations_check \
+            --nokmi_symbol_list_strict_mode \
+            --local_ram_resources=8192 \
+            --local_cpu_resources=4 \
+            //aosp:kernel_aarch64
+
+          # 2. Build gs201_pantah_dist (all Pixel 7 vendor modules + dtbo + vendor_kernel_boot) against our source-built kernel_aarch64
           tools/bazel run \
             --config=pantah \
             --use_prebuilt_gki=false \
             --use_signed_prebuilts=false \
             --download_prebuilt_gki_fips140=false \
+            --lto=none \
             --notrim \
             --nokmi_symbol_list_violations_check \
             --nokmi_symbol_list_strict_mode \
-            //private/devices/google/pantah:gs201_pantah_dist \
             --local_ram_resources=8192 \
             --local_cpu_resources=4 \
+            //private/devices/google/pantah:gs201_pantah_dist \
             -- \
             --dist_dir=out/dist
 
-          echo "=== Verifying built Kernel Image and Config ==="
-          ls -lh out/dist/
-          if [ -f "bazel-bin/private/devices/google/pantah/kernel/Image.lz4" ]; then
-            echo "Using source-compiled Image.lz4 from bazel-bin/private/devices/google/pantah/kernel/Image.lz4"
-            cp -f bazel-bin/private/devices/google/pantah/kernel/Image.lz4 out/dist/Image.lz4
+          echo "=== Verifying source-compiled Kernel Image and IKCONFIG ==="
+          if [ -f "bazel-bin/aosp/kernel_aarch64/Image.lz4" ]; then
+            echo "Copying freshly compiled bazel-bin/aosp/kernel_aarch64/Image.lz4 -> out/dist/Image.lz4"
+            cp -f bazel-bin/aosp/kernel_aarch64/Image.lz4 out/dist/Image.lz4
+            cp -f bazel-bin/aosp/kernel_aarch64/Image out/dist/Image
           fi
+
+          python3 -c '
+          import zlib
+          with open("out/dist/Image", "rb") as f:
+              dec = f.read()
+          idx = dec.find(b"IKCFG_ST\x1f\x8b\x08")
+          assert idx != -1, "IKCFG_ST not found in out/dist/Image!"
+          cfg = zlib.decompress(dec[idx+8:], 16+zlib.MAX_WBITS).decode()
+          for req in ["CONFIG_SQUASHFS=y", "CONFIG_DEVTMPFS=y", "CONFIG_SYSVIPC=y", "CONFIG_USER_NS=y", "CONFIG_PID_NS=y", "CONFIG_OVERLAY_FS=y"]:
+              print("Checking", req, "->", req in cfg)
+              assert req in cfg, f"MISSING REQUIRED CONFIG: {req}"
+          print("ALL HALIUM KERNEL CONFIGS VERIFIED IN COMPILED IMAGE!")
+          '
 
           # Pack boot_b.img directly from our freshly compiled out/dist/Image.lz4 (Boot Header v4)
           python3 -c '
@@ -194,14 +227,57 @@ jobs:
 
       - name: Build Slot-B Safe Initramfs (init_boot_b.img)
         run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
           mkdir -p initramfs_b/{bin,sbin,etc,proc,sys,dev,run,tmp,lib/modules,mnt/super_ro,mnt/writable,mnt/vendor,mnt/vendor_dlkm,mnt/system_dlkm,root}
 
           # Copy static busybox
           cp /bin/busybox initramfs_b/bin/busybox
           chmod +x initramfs_b/bin/busybox
-          for app in sh ash mount umount insmod modprobe lsmod mdev mkdir mknod sleep cat echo grep sed awk cut tr find xargs switch_root losetup dmesg ip ifconfig telnetd chroot ln cp rm chmod chown stat dd sync; do
+          for app in sh ash mount umount insmod modprobe lsmod mdev mkdir mknod sleep cat echo grep sed awk cut tr find xargs switch_root losetup dmesg ip ifconfig telnetd chroot ln cp rm chmod chown stat dd sync basename dirname; do
             ln -sf /bin/busybox "initramfs_b/bin/$app"
           done
+
+          # Compile static super partition scanner (find_super_parts)
+          cat << 'EOF' > find_super_parts.c
+          #define _GNU_SOURCE
+          #define _FILE_OFFSET_BITS 64
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+
+          int main(int argc, char **argv) {
+              const char *dev = (argc > 1) ? argv[1] : "/dev/block/sda30";
+              int fd = open(dev, O_RDONLY);
+              if (fd < 0) return 1;
+
+              uint64_t start_off = 12600000ULL * 512ULL;
+              uint64_t end_off   = 16662528ULL * 512ULL;
+              uint8_t buf[4096];
+              uint64_t found_squash = 0, found_ext4 = 0;
+
+              for (uint64_t off = start_off; off < end_off; off += 65536ULL) {
+                  if (pread(fd, buf, 4096, off) != 4096) break;
+                  if (!found_squash && memcmp(buf, "hsqs", 4) == 0) {
+                      found_squash = off;
+                      printf("system_b %llu 681574400\n", (unsigned long long)off);
+                  }
+                  uint16_t magic = *(uint16_t *)(buf + 1024 + 56);
+                  const char *label = (const char *)(buf + 1024 + 120);
+                  if (!found_ext4 && magic == 0xEF53 && strncmp(label, "ut_writable", 11) == 0) {
+                      found_ext4 = off;
+                      printf("product_b %llu 1310720000\n", (unsigned long long)off);
+                  }
+                  if (found_squash && found_ext4) break;
+              }
+              printf("vendor_a %llu %llu\n", 10981376ULL * 512ULL, 1522024ULL * 512ULL);
+              close(fd);
+              return 0;
+          }
+          EOF
+          aarch64-linux-gnu-gcc -O2 -static -o initramfs_b/bin/find_super_parts find_super_parts.c
 
           # Create the Slot-B Safe Init script (NEVER touches sda31 userdata or sda8 metadata!)
           cat << 'EOF' > initramfs_b/init
@@ -210,7 +286,7 @@ jobs:
 
           /bin/busybox mount -t proc proc /proc
           /bin/busybox mount -t sysfs sysfs /sys
-          /bin/busybox mount -t devtmpfs devtmpfs /dev
+          /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || /bin/busybox mount -t tmpfs tmpfs /dev
           /bin/busybox mkdir -p /dev/pts /dev/socket /dev/block/mapper
           /bin/busybox mount -t devpts devpts /dev/pts
 
@@ -218,99 +294,110 @@ jobs:
           echo "=== [UBUNTU-TOUCH-SLOT-B] Starting Safe Initramfs on Pixel 7 (panther) ==="
 
           # 1. Load early kernel modules from vendor_kernel_boot ramdisk (/lib/modules)
-          if [ -f /lib/modules/modules.load ]; then
-            echo "[UT-INIT] Loading early vendor_kernel_boot modules..."
+          MODLOAD=$(/bin/busybox find /lib/modules -name "modules.load" | /bin/busybox head -n 1)
+          if [ -n "$MODLOAD" ]; then
+            MODDIR=$(/bin/busybox dirname "$MODLOAD")
+            echo "[UT-INIT] Loading early modules from $MODLOAD..."
             while read -r mod; do
               [ -z "$mod" ] && continue
-              /bin/busybox insmod "/lib/modules/$mod" 2>/dev/null || /bin/busybox insmod "/lib/modules/$(/bin/busybox basename "$mod")" 2>/dev/null || true
-            done < /lib/modules/modules.load
+              bname=$(/bin/busybox basename "$mod")
+              /bin/busybox insmod "$MODDIR/$mod" 2>/dev/null || /bin/busybox insmod "$MODDIR/$bname" 2>/dev/null || true
+            done < "$MODLOAD"
           fi
 
           # Wait up to 10s for UFS /dev/block/sda30 (super)
-          for i in $(seq 1 50); do
+          for i in $(/bin/busybox seq 1 50); do
             /bin/busybox mdev -s 2>/dev/null || true
             [ -b /dev/block/sda30 ] && break
+            [ -b /dev/sda30 ] && /bin/busybox ln -sf /dev/sda30 /dev/block/sda30 && break
             /bin/busybox sleep 0.2
           done
 
-          # 2. Bring up USB RNDIS + Debug Telnet on 10.15.19.82 immediately for fail-safe debugging
-          setup_usb_debug() {
-            /bin/busybox mkdir -p /config
-            /bin/busybox mount -t configfs none /config 2>/dev/null || true
-            if [ -d /config/usb_gadget ]; then
-              mkdir -p /config/usb_gadget/g1
-              echo 0x18d1 > /config/usb_gadget/g1/idVendor
-              echo 0xd001 > /config/usb_gadget/g1/idProduct
-              mkdir -p /config/usb_gadget/g1/strings/0x409
-              echo "Pixel7-UT-SlotB" > /config/usb_gadget/g1/strings/0x409/serialnumber
-              echo "Google" > /config/usb_gadget/g1/strings/0x409/manufacturer
-              echo "Pixel 7 Ubuntu Touch" > /config/usb_gadget/g1/strings/0x409/product
-              mkdir -p /config/usb_gadget/g1/functions/rndis.usb0
-              mkdir -p /config/usb_gadget/g1/configs/b.1/strings/0x409
-              ln -sf /config/usb_gadget/g1/functions/rndis.usb0 /config/usb_gadget/g1/configs/b.1/
-              UDC=$(ls /sys/class/udc | head -n 1)
-              [ -n "$UDC" ] && echo "$UDC" > /config/usb_gadget/g1/UDC
-              /bin/busybox ifconfig rndis0 10.15.19.82 netmask 255.255.255.0 up 2>/dev/null || \
-              /bin/busybox ifconfig usb0 10.15.19.82 netmask 255.255.255.0 up 2>/dev/null || true
-              /bin/busybox telnetd -l /bin/sh -b 10.15.19.82:23 2>/dev/null || true
-            fi
-          }
-          setup_usb_debug
-
-          echo "[UT-INIT] Safety check: sda31 (userdata) and sda8 (metadata) are BLOCKED from mounting."
+          # Strictly block access to Slot A userdata (sda31) and metadata (sda8)
           /bin/busybox rm -f /dev/sda31 /dev/block/sda31 /dev/sda8 /dev/block/sda8 2>/dev/null || true
 
-          # 3. Map Slot B logical partitions from super (/dev/block/sda30)
-          # Note: First stage init or parse-android-dynparts maps dm devices, or we mount via sector offsets written at flash time
-          if [ -f /etc/super_b_map.conf ]; then
-            while read -r name start count; do
-              [ -z "$name" ] && continue
-              echo "[UT-INIT] Mapping $name ($start .. $count)"
-              loopdev=$(/bin/busybox losetup -f)
-              /bin/busybox losetup -o $((start * 512)) --sizelimit $((count * 512)) "$loopdev" /dev/block/sda30
-              ln -sf "$loopdev" "/dev/block/mapper/$name"
-            done < /etc/super_b_map.conf
+          # 2. Bring up USB RNDIS + Debug Telnet on 10.15.19.82
+          /bin/busybox mkdir -p /config
+          /bin/busybox mount -t configfs none /config 2>/dev/null || true
+          if [ -d /config/usb_gadget ]; then
+            /bin/busybox mkdir -p /config/usb_gadget/g1
+            echo 0x18d1 > /config/usb_gadget/g1/idVendor
+            echo 0xd001 > /config/usb_gadget/g1/idProduct
+            /bin/busybox mkdir -p /config/usb_gadget/g1/strings/0x409
+            echo "Pixel7-UT-SlotB" > /config/usb_gadget/g1/strings/0x409/serialnumber
+            echo "Google" > /config/usb_gadget/g1/strings/0x409/manufacturer
+            echo "Pixel 7 Ubuntu Touch" > /config/usb_gadget/g1/strings/0x409/product
+            /bin/busybox mkdir -p /config/usb_gadget/g1/functions/rndis.usb0
+            /bin/busybox mkdir -p /config/usb_gadget/g1/configs/b.1/strings/0x409
+            /bin/busybox ln -sf /config/usb_gadget/g1/functions/rndis.usb0 /config/usb_gadget/g1/configs/b.1/
+            UDC=$(/bin/busybox ls /sys/class/udc | /bin/busybox head -n 1)
+            [ -n "$UDC" ] && echo "$UDC" > /config/usb_gadget/g1/UDC
+            /bin/busybox ifconfig rndis0 10.15.19.82 netmask 255.255.255.0 up 2>/dev/null || \
+            /bin/busybox ifconfig usb0 10.15.19.82 netmask 255.255.255.0 up 2>/dev/null || true
+            /bin/busybox telnetd -l /bin/sh -b 10.15.19.82:23 2>/dev/null || true
           fi
 
-          # 4. Mount Ubuntu Touch SquashFS (system_b) + Writable ext4 (product_b) as OverlayFS /root
+          # 3. Automatically locate and map system_b (SquashFS), product_b (ext4 ut_writable), and vendor_a (RO) inside super (/dev/block/sda30)
+          /bin/find_super_parts /dev/block/sda30 > /tmp/super_parts.txt
+          while read -r name byte_off byte_len; do
+            [ -z "$name" ] && continue
+            echo "[UT-INIT] Found $name at offset=$byte_off size=$byte_len"
+            loopdev=$(/bin/busybox losetup -f)
+            if [ "$name" = "product_b" ]; then
+              /bin/busybox losetup -o "$byte_off" --sizelimit "$byte_len" "$loopdev" /dev/block/sda30
+            else
+              /bin/busybox losetup -r -o "$byte_off" --sizelimit "$byte_len" "$loopdev" /dev/block/sda30
+            fi
+            /bin/busybox ln -sf "$loopdev" "/dev/block/mapper/$name"
+          done < /tmp/super_parts.txt
+
+          # 4. Mount Writable ext4 (product_b) first so we can persist boot logs directly to /mnt/writable/ut_boot.log!
+          if [ -b /dev/block/mapper/product_b ]; then
+            /bin/busybox mount -t ext4 -o rw,noatime /dev/block/mapper/product_b /mnt/writable || \
+            /bin/busybox mount -t tmpfs -o size=1536M tmpfs /mnt/writable
+          else
+            /bin/busybox mount -t tmpfs -o size=1536M tmpfs /mnt/writable
+          fi
+
+          # Mount Ubuntu Touch SquashFS (system_b)
           if [ -b /dev/block/mapper/system_b ]; then
             /bin/busybox mount -t squashfs -o ro /dev/block/mapper/system_b /mnt/super_ro || \
             /bin/busybox mount -o ro /dev/block/mapper/system_b /mnt/super_ro
           fi
 
-          if [ -b /dev/block/mapper/product_b ]; then
-            /bin/busybox mount -t ext4 -o rw,noatime /dev/block/mapper/product_b /mnt/writable || true
-          else
-            /bin/busybox mount -t tmpfs -o size=1536M tmpfs /mnt/writable
-          fi
-
           /bin/busybox mkdir -p /mnt/writable/upper /mnt/writable/work /mnt/writable/userdata
+          /bin/busybox dmesg > /mnt/writable/ut_initramfs_dmesg.log 2>&1 || true
+          /bin/busybox cp /tmp/super_parts.txt /mnt/writable/ut_super_parts.log 2>&1 || true
+          /bin/busybox sync
+
           /bin/busybox mount -t overlay overlay -o lowerdir=/mnt/super_ro,upperdir=/mnt/writable/upper,workdir=/mnt/writable/work /root
 
-          # 5. Mount vendor_a (Read-Only) and vendor_dlkm_b / system_dlkm_b for Wi-Fi, BT, NFC, and GPU firmware/modules
+          # 5. Mount vendor_a Read-Only for Wi-Fi / BT / GPU firmware & HALs
           if [ -b /dev/block/mapper/vendor_a ]; then
             /bin/busybox mkdir -p /root/vendor
             /bin/busybox mount -o ro /dev/block/mapper/vendor_a /root/vendor 2>/dev/null || true
           fi
-          if [ -b /dev/block/mapper/vendor_dlkm_b ]; then
-            /bin/busybox mkdir -p /root/vendor_dlkm
-            /bin/busybox mount -o ro /dev/block/mapper/vendor_dlkm_b /root/vendor_dlkm 2>/dev/null || true
-          fi
 
-          # Bind writable userdata inside Slot B overlay
           /bin/busybox mkdir -p /root/userdata
           /bin/busybox mount --bind /mnt/writable/userdata /root/userdata
 
-          # Hand off to Ubuntu Touch systemd if present, else stay in debug shell on 10.15.19.82
-          if [ -x /root/sbin/init ]; then
-            echo "[UT-INIT] Switching root to Ubuntu Touch!"
+          # Move /dev, /proc, /sys into /root for clean systemd switch_root
+          /bin/busybox mkdir -p /root/dev /root/proc /root/sys /root/run
+          /bin/busybox mount --move /dev /root/dev 2>/dev/null || true
+          /bin/busybox mount --move /proc /root/proc 2>/dev/null || true
+          /bin/busybox mount --move /sys /root/sys 2>/dev/null || true
+
+          if [ -x /root/sbin/init ] || [ -L /root/sbin/init ]; then
+            echo "[UT-INIT] Switching root to Ubuntu Touch /sbin/init!"
             exec /bin/busybox switch_root /root /sbin/init
           else
-            echo "[UT-INIT] Staying in initramfs debug shell on 10.15.19.82:23"
+            echo "[UT-INIT] Staying in debug shell on 10.15.19.82:23"
             while true; do /bin/busybox sleep 3600; done
           fi
           EOF
           chmod +x initramfs_b/init
+          mkdir -p initramfs_b/system/bin
+          ln -sf /init initramfs_b/system/bin/init
 
           # Pack initramfs.cpio.lz4
           cd initramfs_b
@@ -322,7 +409,6 @@ jobs:
           import struct
           with open("initramfs_b.cpio.lz4", "rb") as f:
               ramdisk = f.read()
-          # Boot header v4: magic(8), kernel_size(4), ramdisk_size(4), os_version(4), header_size(4), reserved(16), header_version(4), cmdline(1536), sig_size(4)
           hdr = bytearray(4096)
           hdr[0:8] = b"ANDROID!"
           struct.pack_into("<IIII", hdr, 8, 0, len(ramdisk), 536871332, 1584)
@@ -348,11 +434,15 @@ jobs:
 
           sudo tar -xzf ut_build/ut_rootfs.tar.gz -C ut_build/rootfs
 
-          # Copy all compiled Pixel 7 kernel modules (.ko) into /lib/modules/6.1.145-halium
-          sudo mkdir -p ut_build/rootfs/lib/modules/panther
+          # Copy all compiled Pixel 7 kernel modules (.ko) into /lib/modules/panther and /lib/modules/<uname -r>
+          KREL=$(strings workspace/out/dist/Image | sed -n 's/^Linux version \([^ ]*\).*/\1/p' | head -n 1)
+          echo "Detected compiled kernel release: $KREL"
+          sudo mkdir -p ut_build/rootfs/lib/modules/panther "ut_build/rootfs/lib/modules/$KREL/kernel"
           sudo cp workspace/out/dist/*.ko ut_build/rootfs/lib/modules/panther/ || true
+          sudo cp workspace/out/dist/*.ko "ut_build/rootfs/lib/modules/$KREL/kernel/" || true
           sudo cp workspace/out/dist/vendor_dlkm.modules.load ut_build/rootfs/lib/modules/panther/ || true
           sudo cp workspace/out/dist/system_dlkm.modules.load ut_build/rootfs/lib/modules/panther/ || true
+          sudo depmod -b ut_build/rootfs "$KREL" || true
 
           # Create Pixel 7 (panther) Hardware Bringup Service (Wi-Fi bcmdhd4389, Bluetooth btbcm/hci_uart, NFC st21nfc, Display/GPU Mali)
           cat << 'EOF' | sudo tee ut_build/rootfs/usr/local/bin/panther-hw-init.sh > /dev/null
@@ -394,6 +484,8 @@ jobs:
           # 5. Bring up USB RNDIS SSH debug interface (10.15.19.82)
           ip addr add 10.15.19.82/24 dev rndis0 2>/dev/null || ip addr add 10.15.19.82/24 dev usb0 2>/dev/null || true
           ip link set rndis0 up 2>/dev/null || ip link set usb0 up 2>/dev/null || true
+          dmesg > /userdata/ut_systemd_dmesg.log 2>&1 || true
+          sync
           EOF
           sudo chmod +x ut_build/rootfs/usr/local/bin/panther-hw-init.sh
 
@@ -413,6 +505,7 @@ jobs:
           [Install]
           WantedBy=sysinit.target
           EOF
+          sudo mkdir -p ut_build/rootfs/etc/systemd/system/sysinit.target.wants
           sudo ln -sf /etc/systemd/system/panther-hw-init.service ut_build/rootfs/etc/systemd/system/sysinit.target.wants/panther-hw-init.service 2>/dev/null || true
 
           # Create udev rules for Pixel 7 (GPU Mali, Display DRM, Touch, NFC, Audio, BT)
@@ -425,7 +518,7 @@ jobs:
           SUBSYSTEM=="input", MODE="0666", GROUP="input"
           KERNEL=="st21nfc", MODE="0666", GROUP="nfc"
           KERNEL=="ttySAC*", MODE="0666", GROUP="bluetooth"
-          KERNEL==" nitro*", MODE="0666", GROUP="bluetooth"
+          KERNEL=="nitro*", MODE="0666", GROUP="bluetooth"
           KERNEL=="aoc*", MODE="0666", GROUP="audio"
           KERNEL=="binder", MODE="0666"
           KERNEL=="hwbinder", MODE="0666"
@@ -436,12 +529,12 @@ jobs:
           sudo rm -f ut_build/rootfs/etc/fstab
           sudo touch ut_build/rootfs/etc/fstab
 
-          # Compress RootFS into SquashFS (ZSTD level 19) to fit cleanly in Slot B super free space (~950 MB)
+          # Compress RootFS into SquashFS (ZSTD level 19) to fit cleanly in Slot B super free space (~630 MB)
           echo "=== Compressing Ubuntu Touch RootFS into system_b.img (SquashFS) ==="
           sudo mksquashfs ut_build/rootfs system_b.img -comp zstd -Xcompression-level 19 -b 1M -noappend
           ls -lh system_b.img
 
-      - name: Package All Slot-B Images & Flashing Script
+      - name: Sign Slot-B Boot Images with AVB0 Hash Descriptors & Package
         run: |
           mkdir -p package/slot_b
           cp workspace/out/dist/boot.img package/slot_b/boot_b.img
@@ -453,6 +546,25 @@ jobs:
           cp workspace/out/dist/system_dlkm.img package/slot_b/system_dlkm_b.img
           cp system_b.img package/slot_b/system_b.img
 
+          AVBTOOL=$(find workspace/ -name "avbtool" -type f | head -n 1)
+          echo "Using avbtool: $AVBTOOL"
+          "$AVBTOOL" erase_footer --image package/slot_b/boot_b.img 2>/dev/null || true
+          "$AVBTOOL" add_hash_footer --image package/slot_b/boot_b.img --partition_name boot --partition_size 67108864
+
+          "$AVBTOOL" erase_footer --image package/slot_b/init_boot_b.img 2>/dev/null || true
+          "$AVBTOOL" add_hash_footer --image package/slot_b/init_boot_b.img --partition_name init_boot --partition_size 8388608
+
+          "$AVBTOOL" erase_footer --image package/slot_b/vendor_kernel_boot_b.img 2>/dev/null || true
+          "$AVBTOOL" add_hash_footer --image package/slot_b/vendor_kernel_boot_b.img --partition_name vendor_kernel_boot --partition_size 67108864
+
+          "$AVBTOOL" erase_footer --image package/slot_b/dtbo_b.img 2>/dev/null || true
+          "$AVBTOOL" add_hash_footer --image package/slot_b/dtbo_b.img --partition_name dtbo --partition_size 16777216
+
+          for img in boot_b.img init_boot_b.img vendor_kernel_boot_b.img dtbo_b.img; do
+            echo "=== AVB info for $img ==="
+            "$AVBTOOL" info_image --image "package/slot_b/$img"
+          done
+
           ls -lh package/slot_b/
 
       - name: Upload Ubuntu Touch Slot-B Images
@@ -461,3 +573,4 @@ jobs:
           name: UbuntuTouch-SlotB-Pixel7-6.1.145
           path: package/slot_b/*
           retention-days: 7
+
