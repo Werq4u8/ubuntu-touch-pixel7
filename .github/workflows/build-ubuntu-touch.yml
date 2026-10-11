@@ -122,16 +122,30 @@ jobs:
           CONFIG_MAC80211=m
           CONFIG_MAC80211_INJECT=y
           CONFIG_USB_RTL8150=n
+          CONFIG_TRIM_UNUSED_KSYMS=n
           EOF
 
-          # Disable check_defconfig strict failure in Kleaf so custom Halium configs are accepted in full source build
-          find . -name "BUILD.bazel" -exec sed -i 's/check_defconfig = "minimized"/check_defconfig = "disabled"/g' {} + || true
-          find . -name "BUILD.bazel" -exec sed -i 's/check_defconfig = "true"/check_defconfig = "disabled"/g' {} + || true
+          # Also append make_kuid / from_kuid / from_kuid_munged to pixel ABI symbol list
+          for abi in ./aosp/android/abi_gki_aarch64*; do
+            if [ -f "$abi" ]; then
+              chmod +w "$abi"
+              printf "\n  make_kuid\n  from_kuid\n  from_kuid_munged\n" >> "$abi"
+            fi
+          done
+          sed -i '1i KBUILD_MODPOST_WARN := 1' ./aosp/scripts/Makefile.modpost || true
+
+          # Disable check_defconfig and trim_nonlisted_kmi in Kleaf so custom Halium configs & symbols are accepted
+          find . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/check_defconfig = "minimized"/check_defconfig = "disabled"/g' {} + || true
+          find . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/check_defconfig = "true"/check_defconfig = "disabled"/g' {} + || true
+          find . \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/trim_nonlisted_kmi = True/trim_nonlisted_kmi = False/g' {} + || true
+
+          # Replace kernel_aarch64_download_or_build with source-built kernel_aarch64 so vmlinux & modules share CONFIG_USER_NS
+          find private/ \( -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/kernel_aarch64_download_or_build/kernel_aarch64/g' {} + || true
 
           # Force full source compilation of GKI boot.img + vendor modules (disable prebuilt GKI download without deleting flag_alias in common.bazelrc)
           find . -name "*.bazelrc" -exec sed -i 's/13202960/14691759/g' {} + || true
-          find . -name "device.bazelrc" -exec sed -i 's/--use_prebuilt_gki$/--use_prebuilt_gki=false/g' {} + || true
-          find . -name "device.bazelrc" -exec sed -i 's/--use_prebuilt_gki=true/--use_prebuilt_gki=false/g' {} + || true
+          find . -name "*.bazelrc" -exec sed -i 's/--use_prebuilt_gki$/--use_prebuilt_gki=false/g' {} + || true
+          find . -name "*.bazelrc" -exec sed -i 's/--use_prebuilt_gki=true/--use_prebuilt_gki=false/g' {} + || true
           find . -name "*.bazelrc" -exec sed -i 's/build --use_signed_prebuilts=true/build --use_signed_prebuilts=false/g' {} + || true
           find . -name "*.bazelrc" -exec sed -i 's/build --download_prebuilt_gki_fips140=true/build --download_prebuilt_gki_fips140=false/g' {} + || true
 
