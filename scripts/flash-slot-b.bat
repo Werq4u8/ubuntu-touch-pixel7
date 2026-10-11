@@ -49,8 +49,8 @@ fastboot delete-logical-partition system_dlkm_b 2>nul
 
 fastboot create-logical-partition vendor_dlkm_b 52428800
 fastboot create-logical-partition system_dlkm_b 16777216
-fastboot create-logical-partition system_b 1153433600
-fastboot create-logical-partition product_b 536870912
+fastboot create-logical-partition system_b 681574400
+fastboot create-logical-partition product_b 1317011456
 
 fastboot flash vendor_dlkm_b vendor_dlkm_b.img
 fastboot flash system_dlkm_b system_dlkm_b.img
